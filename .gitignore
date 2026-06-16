@@ -1,0 +1,11 @@
+reviews/
+.review-status.json
+.DS_Store
+build/
+dist/
+*.epub
+*.fb2
+*.pdf
+*.docx
+.venv/
+__pycache__/

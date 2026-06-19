@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Прогон параграфа книги через трёх внешних редакторов параллельно.
+"""Прогон параграфа книги через обойму редакторов параллельно.
+
+Обойма:
+  - DeepSeek (deepseek-chat)        — фактчек платформы 1С
+  - GPT-5.5  (structure)            — архитектура текста
+  - GPT-5.5  (metaphor)             — устойчивость образов
+  - GPT-5.5  (tone)                 — звучание (опционально, флаг --tone)
+  - Gemini 2.5 Flash                — адверсар + читатель-первокурсник
 
 Usage:
     python3 scripts/review.py A0
-    python3 scripts/review.py B3.5
+    python3 scripts/review.py B3.5 --tone
     python3 scripts/review.py chapters/02_ruki/02-04_pishu_chitayu.md
 
-Output: reviews/<label>/{deepseek,openai,gemini}.md
+Output: reviews/<label>/{deepseek,gpt55-structure,gpt55-metaphor,gpt55-tone,gemini}.md
 """
 import os
 import sys
 import json
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -52,8 +60,7 @@ def load_env():
         os.environ.setdefault(k.strip(), v.strip())
 
 
-def http_post(url, headers, body, timeout=600, retries=3):
-    import time
+def http_post(url, headers, body, timeout=900, retries=3):
     data = json.dumps(body).encode("utf-8")
     last_err = None
     for attempt in range(retries):
@@ -63,9 +70,9 @@ def http_post(url, headers, body, timeout=600, retries=3):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            last_err = f"HTTP {e.code}: {err_body[:1000]}"
+            last_err = f"HTTP {e.code}: {err_body[:1500]}"
             if e.code in (429, 503) and attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
+                time.sleep(10 * (attempt + 1))
                 continue
             raise RuntimeError(last_err) from None
     raise RuntimeError(last_err)
@@ -87,17 +94,22 @@ def call_deepseek(system_prompt, user_content):
     return resp["choices"][0]["message"]["content"]
 
 
-def call_openai(system_prompt, user_content):
+def call_openai(model, system_prompt, user_content):
+    """GPT-5.x семья использует max_completion_tokens вместо max_tokens."""
     key = os.environ["OPENAI_API_KEY"]
+    is_gpt5 = model.startswith("gpt-5")
     body = {
-        "model": "gpt-4o",
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_content},
         ],
-        "temperature": 0.3,
-        "max_tokens": 8000,
     }
+    if is_gpt5:
+        body["max_completion_tokens"] = 8000
+    else:
+        body["temperature"] = 0.3
+        body["max_tokens"] = 8000
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     resp = http_post("https://api.openai.com/v1/chat/completions", headers, body)
     return resp["choices"][0]["message"]["content"]
@@ -125,9 +137,9 @@ def call_gemini(system_prompt, user_content):
 
 
 def build_context(paragraph_text, paragraph_label):
-    constitution   = (ROOT / "spec" / "constitution.md").read_text()
-    specification  = (ROOT / "spec" / "specification.md").read_text()
-    claude_md      = (ROOT / "CLAUDE.md").read_text()
+    constitution  = (ROOT / "spec" / "constitution.md").read_text()
+    specification = (ROOT / "spec" / "specification.md").read_text()
+    claude_md     = (ROOT / "CLAUDE.md").read_text()
     return f"""# КОНТЕКСТ КНИГИ
 
 ## CLAUDE.md (рабочие соглашения, канон, стиль)
@@ -181,54 +193,71 @@ def resolve_path(arg):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if not args:
         sys.exit(
-            f"Usage: {sys.argv[0]} <§ shortcut or file path>\n"
-            f"Шорткаты: {', '.join(PARA_MAP.keys())}"
+            f"Usage: {sys.argv[0]} <§ shortcut or path> [--tone]\n"
+            f"Шорткаты: {', '.join(PARA_MAP)}"
         )
     load_env()
 
-    rel_path, label = resolve_path(sys.argv[1])
+    rel_path, label = resolve_path(args[0])
     para_file = ROOT / rel_path
     paragraph_text = para_file.read_text()
     context = build_context(paragraph_text, f"§{label}  ({rel_path})")
 
-    prompts = {
-        "deepseek": (PROMPTS / "deepseek-fact.md").read_text(),
-        "openai":   (PROMPTS / "openai-style.md").read_text(),
-        "gemini":   (PROMPTS / "gemini-adversary.md").read_text(),
+    # Обойма: имя → (callable, описание, имя-файла-вывода)
+    GPT5 = "gpt-5.5"
+
+    def gpt55_role(role):
+        def f(p): return call_openai(GPT5, p, context)
+        return f
+
+    editors = {
+        "deepseek": (
+            lambda: call_deepseek((PROMPTS / "deepseek-fact.md").read_text(), context),
+            "DeepSeek — фактчек 1С",
+        ),
+        "gpt55-structure": (
+            lambda: gpt55_role("structure")((PROMPTS / "openai-structure.md").read_text()),
+            "GPT-5.5 — структура",
+        ),
+        "gpt55-metaphor": (
+            lambda: gpt55_role("metaphor")((PROMPTS / "openai-metaphor.md").read_text()),
+            "GPT-5.5 — метафоры",
+        ),
+        "gemini": (
+            lambda: call_gemini((PROMPTS / "gemini-adversary.md").read_text(), context),
+            "Gemini — адверсар + читатель",
+        ),
     }
+    if "--tone" in flags:
+        editors["gpt55-tone"] = (
+            lambda: gpt55_role("tone")((PROMPTS / "openai-tone.md").read_text()),
+            "GPT-5.5 — тон и ритм",
+        )
 
     out_dir = REVIEWS / label
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = {
-        "deepseek": (call_deepseek, "DeepSeek — фактчек 1С"),
-        "openai":   (call_openai,   "GPT-4o — стиль и канон"),
-        "gemini":   (call_gemini,   "Gemini 2.5 Pro — адверсар + читатель"),
-    }
-
     print(f"\n→ Параграф: §{label}  ({rel_path})")
-    print(f"→ Запускаю 3 редактора параллельно…\n")
-
-    def run(name):
-        fn, _ = tasks[name]
-        return fn(prompts[name], context)
+    print(f"→ Редакторы: {len(editors)}  (параллельно)\n")
 
     results = {}
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = {ex.submit(run, name): name for name in tasks}
+    with ThreadPoolExecutor(max_workers=len(editors)) as ex:
+        futures = {ex.submit(fn): (name, lbl) for name, (fn, lbl) in editors.items()}
         for fut in futures:
-            name = futures[fut]
+            name, lbl = futures[fut]
+            t0 = time.monotonic()
             try:
                 results[name] = fut.result()
-                _, role_label = tasks[name]
-                print(f"  ✓ {role_label}: {len(results[name])} симв.")
+                secs = time.monotonic() - t0
+                print(f"  ✓ {lbl:<36} {len(results[name]):>6} симв.  ({secs:.1f}s)")
             except Exception as e:
-                _, role_label = tasks[name]
                 err = f"{type(e).__name__}: {e}"
-                results[name] = f"# ОШИБКА вызова\n\n```\n{err}\n```\n"
-                print(f"  ✗ {role_label}: {err}")
+                results[name] = f"# ОШИБКА вызова\n\n```\n{err[:2000]}\n```\n"
+                print(f"  ✗ {lbl:<36} {err[:80]}")
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     for name, content in results.items():
@@ -238,7 +267,7 @@ def main():
 
     print(
         f"\nГотово. Отчёты в {out_dir.relative_to(ROOT)}/. "
-        f"Дальше — Claude читает три файла и пишет synthesis.md.\n"
+        f"Дальше — Claude собирает synthesis.md.\n"
     )
 
 

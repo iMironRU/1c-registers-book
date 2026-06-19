@@ -1,5 +1,8 @@
 reviews/
 .review-status.json
+.env
+.env.*
+!.env.example
 .DS_Store
 build/
 dist/
